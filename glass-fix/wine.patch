@@ -1,0 +1,245 @@
+--- a/src/glass_cockpit_dlss_fix.cpp
++++ b/src/glass_cockpit_dlss_fix.cpp
+@@ -773,10 +773,28 @@
+ std::mutex diag_mutex;
+ std::unordered_map<Signature, ViewInfo, SignatureHash> diag_views;
+ 
++#if defined(_MSC_VER)
+ bool read_bytes(const void* source, void* destination, size_t size) {
+     __try { std::memcpy(destination, source, size); return true; }
+     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+ }
++#else
++// GCC/MinGW has no __try: check that every page of the source range is committed and readable before copying.
++bool read_bytes(const void* source, void* destination, size_t size) {
++    auto address = reinterpret_cast<uintptr_t>(source);
++    const uintptr_t end = address + size;
++    while (address < end) {
++        MEMORY_BASIC_INFORMATION info{};
++        if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) || info.State != MEM_COMMIT ||
++            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++            !(info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++            return false;
++        address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
++    }
++    std::memcpy(destination, source, size);
++    return true;
++}
++#endif
+ 
+ bool rgba8(DXGI_FORMAT format) {
+     switch (format) {
+@@ -899,6 +917,12 @@
+     ComPtr<ID3D12Resource> timestamps_readback;
+     UINT timed_calls = 0; // under composite_mutex
+ };
++#if !defined(_MSC_VER)
++} // namespace
++__CRT_UUID_DECL(DeviceState, 0x2B8D0E51, 0x7C1A, 0x4F43, 0x9A, 0x07, 0x8E, 0x4C, 0x51, 0xD2, 0xF6, 0xA3)
++namespace {
++#endif
++
+ 
+ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
+     ID3D12GraphicsCommandList* native = nullptr;
+@@ -915,6 +939,12 @@
+     uint64_t pass_rt0 = 0; UINT pass_targets = 0; // inside a render pass: its first render target (pixel probe)
+     bool scissor_known = false;
+ };
++#if !defined(_MSC_VER)
++} // namespace
++__CRT_UUID_DECL(ListState, 0x9E1F3C77, 0x5A2B, 0x4D8E, 0xB0, 0xC4, 0x71, 0xD6, 0xA2, 0xE9, 0xF0, 0x15)
++namespace {
++#endif
++
+ 
+ Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
+     std::lock_guard lock(device.maps_mutex);
+@@ -1044,7 +1074,11 @@
+         D3D12_DESCRIPTOR_HEAP_DESC h{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+         native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&state->scratch));
+     }
+-    track_descriptors = !gpu_nvidia || force_tracking;
++    // Under Wine (vkd3d-proton) descriptor handles are encoded, not pointers to NVIDIA's descriptor bytes, so the byte
++    // signatures never match: identify screen textures by tracking views through the copy calls, as on other GPUs.
++    static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
++    track_descriptors = !gpu_nvidia || force_tracking || wine;
++    if (wine) LOG_ONCE("note running under Wine: screen textures identified by descriptor tracking");
+     if (track_descriptors && !texture_ids) texture_ids = std::make_unique<TextureId[]>(max_texture_ids);
+     main_state = state;
+     main_device = native;
+@@ -1086,9 +1120,41 @@
+         state.display_bindings[layout] = have[0] ? bindings : std::array<std::pair<uint32_t, uint32_t>, 2>{{{UINT32_MAX, 0}, bindings[1]}};
+     }
+ }
++// Root signatures are identified by their serialized content, not by object. The Windows D3D12 runtime returns the same
++// object for a blob it has seen before, so the sim's pipelines and its SetGraphicsRootSignature calls share pointers
++// there. vkd3d-proton (Linux/Wine) creates a new object every time: the sim's display pipeline then names one object
++// and its draws bind another with identical content, and every screen draw failed the root_layout check.
++std::shared_mutex root_ids_mutex;
++std::unordered_map<uint64_t, uint64_t> root_ids; // root signature object -> content id
++std::unordered_set<uint64_t> root_contents; // content ids already recorded
++std::atomic<uint64_t> root_duplicates{0};
++uint64_t root_content_id(const void* blob, SIZE_T size) {
++    uint64_t h = 1469598103934665603ull; // FNV-1a
++    for (SIZE_T i = 0; i < size; ++i) h = (h ^ static_cast<const uint8_t*>(blob)[i]) * 1099511628211ull;
++    return h | 1; // never 0: a layout of 0 means "none bound"
++}
++uint64_t layout_id(const void* root) {
++    if (!root) return 0;
++    std::shared_lock lock(root_ids_mutex);
++    const auto found = root_ids.find(reinterpret_cast<uint64_t>(root));
++    return found != root_ids.end() ? found->second : reinterpret_cast<uint64_t>(root);
++}
+ void root_signature_created(const void* blob, SIZE_T size, ID3D12RootSignature* root) noexcept try {
+     auto state = main_state;
+     if (!state) return;
++    const auto id = root_content_id(blob, size);
++    bool known = false;
++    {
++        std::unique_lock lock(root_ids_mutex);
++        known = !root_contents.insert(id).second;
++        root_ids[reinterpret_cast<uint64_t>(root)] = id;
++    }
++    if (known) {
++        const auto n = ++root_duplicates;
++        if (n <= 5) log("root_signature duplicate content: object %p shares id %016llx with an earlier one (%llu so far)", static_cast<void*>(root),
++            static_cast<unsigned long long>(id), static_cast<unsigned long long>(n));
++        return; // same content, same layout: already recorded
++    }
+     ComPtr<ID3D12VersionedRootSignatureDeserializer> reader;
+     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
+     if (SUCCEEDED(D3D12CreateVersionedRootSignatureDeserializer(blob, size, IID_PPV_ARGS(&reader)))) desc = reader->GetUnconvertedRootSignatureDesc();
+@@ -1096,7 +1162,7 @@
+         LOG_ONCE("note a root signature could not be read (its draws are not inspected)");
+         return;
+     }
+-    const auto layout = reinterpret_cast<uint64_t>(root);
++    const auto layout = id;
+     // Versions 1.1 and 1.2 have the same parameters (1.2 only adds to static samplers).
+     if (desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) layout_created(*state, layout, desc->Desc_1_0.NumParameters, desc->Desc_1_0.pParameters);
+     else layout_created(*state, layout, desc->Desc_1_1.NumParameters, desc->Desc_1_1.pParameters);
+@@ -1134,6 +1200,12 @@
+         return left;
+     }
+ };
++#if !defined(_MSC_VER)
++} // namespace
++__CRT_UUID_DECL(ReleaseNotifier, 0x5C0E6A2D, 0x3B1F, 0x4E8A, 0x9D, 0x47, 0x0F, 0x2B, 0x8C, 0x61, 0xA3, 0xE9)
++namespace {
++#endif
++
+ void notify_on_destroy(ID3D12Resource* native) {
+     auto notifier = new ReleaseNotifier(native);
+     if (FAILED(native->SetPrivateDataInterface(__uuidof(ReleaseNotifier), notifier))) notifier->attached = false;
+@@ -1298,7 +1370,7 @@
+     if (!enabled.load(std::memory_order_relaxed)) return;
+     auto state = list_state(list);
+     if (!state) return;
+-    const auto layout = reinterpret_cast<uint64_t>(root);
++    const auto layout = layout_id(root);
+     if (state->layout != layout) { state->layout = layout; state->tables = {}; } // a new root signature unbinds all tables
+ }
+ void table_bound(ID3D12GraphicsCommandList* list, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) {
+@@ -1342,7 +1414,15 @@
+     {
+         std::shared_lock lock(device.layouts_mutex);
+         const auto found = device.display_bindings.find(state.layout);
+-        if (found == device.display_bindings.end() || state.layout != reinterpret_cast<uint64_t>(state.display->root.Get())) { note(stats.unsupported_draw, "root_layout"); return false; }
++        if (found == device.display_bindings.end() || state.layout != layout_id(state.display->root.Get())) {
++            static std::atomic<int> reported{0};
++            if (reported.fetch_add(1) < 5)
++                log("root_layout detail: bound %016llx known=%d pipeline root %p -> %016llx", static_cast<unsigned long long>(state.layout),
++                    int(found != device.display_bindings.end()), static_cast<void*>(state.display->root.Get()),
++                    static_cast<unsigned long long>(layout_id(state.display->root.Get())));
++            note(stats.unsupported_draw, "root_layout");
++            return false;
++        }
+         binding = found->second[state.display->screen_t0 ? 0 : 1];
+     }
+     if (binding.first >= state.tables.size()) { note(stats.unsupported_draw, "root_layout"); return false; }
+@@ -1351,12 +1431,14 @@
+     const auto address = descriptor_address(table, binding.second);
+     if (!address) { note(stats.unsupported_draw, "descriptor_heap_unknown"); return false; }
+     Signature s{};
+-    if (!read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size)) {
++    // Under Wine the handles are encoded and need not point at readable memory; tracking does not read them.
++    const bool readable = read_bytes(reinterpret_cast<const void*>(address), s.bytes.data(), descriptor_size);
++    if (!readable && !track_descriptors.load(std::memory_order_relaxed)) {
+         note(stats.unknown_texture, "descriptor_unreadable"); return false;
+     }
+     Texture texture;
+     bool recognised = false;
+-    if (!force_tracking) {
++    if (readable && !force_tracking) {
+         std::shared_lock lock(textures_mutex);
+         if (const auto found = signatures.find(s); found != signatures.end()) { texture = found->second; recognised = true; }
+     }
+@@ -1540,7 +1622,7 @@
+             const auto address = descriptor_address(table, r.offset + k);
+             if (!address) continue;
+             Signature sig{};
+-            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size)) continue;
++            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size) && !track_descriptors.load(std::memory_order_relaxed)) continue;
+             ID3D12Resource* resource = nullptr;
+             {
+                 std::shared_lock lock(textures_mutex);
+@@ -1647,7 +1729,7 @@
+             const auto address = descriptor_address(table, r.offset + k);
+             if (!address) continue;
+             Signature sig{};
+-            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size)) continue;
++            if (!read_bytes(reinterpret_cast<const void*>(address), sig.bytes.data(), descriptor_size) && !track_descriptors.load(std::memory_order_relaxed)) continue;
+             ID3D12Resource* resource = nullptr;
+             {
+                 std::shared_lock lock(textures_mutex);
+@@ -1744,6 +1826,12 @@
+ // Indirect commands (ExecuteIndirect): what each command signature runs, as ReShade's add-on events report it.
+ enum class Indirect { unknown = 0, draw = 1, draw_indexed = 2, dispatch = 3 };
+ struct __declspec(uuid("7D3B9A1E-2C64-4F0B-8E51-A9C02F6D4B37")) IndirectCommand { Indirect type = Indirect::unknown; UINT stride = 0; };
++#if !defined(_MSC_VER)
++} // namespace
++__CRT_UUID_DECL(IndirectCommand, 0x7D3B9A1E, 0x2C64, 0x4F0B, 0x8E, 0x51, 0xA9, 0xC0, 0x2F, 0x6D, 0x4B, 0x37)
++namespace {
++#endif
++
+ void command_signature_created(const D3D12_COMMAND_SIGNATURE_DESC& desc, ID3D12CommandSignature* signature) {
+     IndirectCommand command{Indirect::unknown, desc.ByteStride};
+     if (desc.NumArgumentDescs && desc.pArgumentDescs) {
+--- a/src/ngx_interface.hpp
++++ b/src/ngx_interface.hpp
+@@ -9,6 +9,7 @@
+ enum NVSDK_NGX_Result : int { NVSDK_NGX_Result_Success = 0x1, NVSDK_NGX_Result_FAIL_InvalidParameter = int(0xBAD00005) };
+ 
+ struct NVSDK_NGX_Parameter {
++#if defined(_MSC_VER)
+     virtual void Set(const char* name, unsigned long long value) = 0;
+     virtual void Set(const char* name, float value) = 0;
+     virtual void Set(const char* name, double value) = 0;
+@@ -25,6 +26,26 @@
+     virtual NVSDK_NGX_Result Get(const char* name, ID3D11Resource** value) const = 0;
+     virtual NVSDK_NGX_Result Get(const char* name, ID3D12Resource** value) const = 0;
+     virtual NVSDK_NGX_Result Get(const char* name, void** value) const = 0;
++#else
++    // GCC/MinGW lays out overloaded virtual functions in declaration order, MSVC in reverse order within each
++    // name. The parameter objects come from MSVC-built DLLs (NGX, OptiScaler), so declare them reversed here.
++    virtual void Set(const char* name, void* value) = 0;
++    virtual void Set(const char* name, ID3D12Resource* value) = 0;
++    virtual void Set(const char* name, ID3D11Resource* value) = 0;
++    virtual void Set(const char* name, int value) = 0;
++    virtual void Set(const char* name, unsigned int value) = 0;
++    virtual void Set(const char* name, double value) = 0;
++    virtual void Set(const char* name, float value) = 0;
++    virtual void Set(const char* name, unsigned long long value) = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, void** value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, ID3D12Resource** value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, ID3D11Resource** value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, int* value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, unsigned int* value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, double* value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, float* value) const = 0;
++    virtual NVSDK_NGX_Result Get(const char* name, unsigned long long* value) const = 0;
++#endif
+     virtual void Reset() = 0;
+ };
+ 

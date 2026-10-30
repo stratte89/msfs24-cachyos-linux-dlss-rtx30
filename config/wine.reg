@@ -1,0 +1,14 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"version"="native,builtin"
+"nvapi64"="native,builtin"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\NVIDIA Corporation\Global\NGXCore]
+"FullPath"="C:\\Windows\\System32"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\FlightSimulator2024.exe\DllOverrides]
+"winmm"="native,builtin"
+
+[HKEY_CURRENT_USER\Environment]
+"VKD3D_CONFIG"="no_upload_hvv"
