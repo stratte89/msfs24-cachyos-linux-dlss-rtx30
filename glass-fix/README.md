@@ -42,7 +42,12 @@ The fix runs from sim start. Keys in the sim:
 | Ctrl+Shift+F11 | green tint on every fixed screen |
 | Ctrl+Shift+F9 | fix on/off |
 
-Settings: `glass-cockpit-dlss-fix.ini` in the game folder.
+Settings: `glass-cockpit-dlss-fix.ini` in the game folder (a known-good copy ships in `config/`).
+
+## Known issues
+
+- **All displays start shaking after a while.** The fix re-derives each screen's recorded draw position every frame and composites all screens through one shared jitter path; the default jitter mode (`jitter_positive=0`) can desync from the sim's jitter sequence — every composited screen then lands a pixel or two off in alternating directions, so all displays shake at once. Set `jitter_positive=1` in `glass-cockpit-dlss-fix.ini` (applies within a second, no restart). The `stable_edges`, `calm_glass`, `temporal_aa` and `dark_screen_fix` options did not address the shaking in testing.
+- `skipped (screen doesn't match the sim's picture)` in the log marks a screen whose recorded texture failed the match for that frame — it falls back to the sim's raw upscale for that frame, and a screen riding the match boundary flickers between paths.
 
 ## Known
 
